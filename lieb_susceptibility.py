@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from time import perf_counter
@@ -475,12 +476,75 @@ def save_data(out, p, path, distance, ticks, pair, ph, pp_channels, ph_channels)
         indent=2) + "\n")
 
 
-def main():
+# =====================================================================
+# 8. Entry points: importable (notebook) and command line
+# =====================================================================
+def build_parameters(t=None, a0=None, lam=None, mu=None,
+                     temperature=None, **rest):
+    """Parameters with the energies tracking t whenever they are omitted."""
+    t = DEFAULTS.t if t is None else float(t)
+    return replace(
+        DEFAULTS,
+        t=t,
+        a0=DEFAULTS.a0 if a0 is None else float(a0),
+        lam=LAMBDA_OVER_T * t if lam is None else float(lam),
+        mu=MU_OVER_T * t if mu is None else float(mu),
+        temperature=(TEMPERATURE_OVER_T * t if temperature is None
+                     else float(temperature)),
+        **rest,
+    )
+
+
+def running_in_notebook():
+    """True inside a Jupyter/IPython kernel, whose sys.argv holds -f kernel.json."""
+    try:
+        shell = sys.modules["IPython"].get_ipython()
+    except (KeyError, AttributeError):
+        return False
+    return shell is not None and shell.__class__.__name__ == "ZMQInteractiveShell"
+
+
+def run(out="lieb_results", save=True, plot=True, progress=True,
+        parameters=None, **overrides):
+    """Notebook entry point, e.g. run(nk=80, mu=1.0, bands="all").
+
+    Accepts any Parameters field as a keyword; t, a0, lam, mu and
+    temperature are in eV and Angstrom. Returns a dictionary with the
+    parameters, the path, the full complex matrices and the figures.
+    Figures are left open so that Jupyter displays them inline.
+    """
+    if parameters is not None and overrides:
+        raise TypeError("Pass either parameters=... or keyword overrides.")
+    p = parameters if parameters is not None else build_parameters(**overrides)
+    p.validate()
+    solver = SusceptibilitySolver(p)
+    path, distance, ticks = gamma_x_m_gamma(p)
+    pair, ph = solver.solve(path, progress=progress)
+    figures = []
+    out = Path(out)
+    if save or plot:
+        out.mkdir(parents=True, exist_ok=True)
+    if save:
+        save_data(out, p, path, distance, ticks, pair, ph,
+                  solver.pp_channels, solver.ph_channels)
+    if plot:
+        figures = make_plots(p, distance, ticks, pair, ph,
+                             solver.pp_channels, solver.ph_channels, out)
+    return {
+        "parameters": p, "unit": susceptibility_unit(p),
+        "external_momentum": path, "path_distance": distance,
+        "path_ticks": ticks, "Pi": pair, "Chi": ph,
+        "pp_channels": solver.pp_channels, "ph_channels": solver.ph_channels,
+        "figures": figures, "out": out,
+    }
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--t", type=float, default=DEFAULTS.t,
+    parser.add_argument("--t", type=float, default=None,
                         help=f"Hopping in {ENERGY_UNIT} (default {HOPPING_EV:g}).")
-    parser.add_argument("--a0", type=float, default=DEFAULTS.a0,
+    parser.add_argument("--a0", type=float, default=None,
                         help=f"Lattice constant in {LENGTH_UNIT} "
                              f"(default {LATTICE_ANGSTROM:g}).")
     parser.add_argument("--lam", type=float, default=None,
@@ -503,35 +567,30 @@ def main():
     parser.add_argument("--units", choices=["per_area", "per_cell"], default=DEFAULTS.units)
     parser.add_argument("--out", type=Path, default=Path("lieb_results"))
     parser.add_argument("--show", action="store_true", help="Open both figures after saving.")
-    args = parser.parse_args()
-    # Unspecified energies track the hopping, so --t alone rescales the model.
-    scaled = {
-        "lam": LAMBDA_OVER_T * args.t if args.lam is None else args.lam,
-        "mu": MU_OVER_T * args.t if args.mu is None else args.mu,
-        "temperature": (TEMPERATURE_OVER_T * args.t
-                        if args.temperature is None else args.temperature),
-    }
-    p = replace(DEFAULTS, **{
-        name: getattr(args, name) for name in
-        ("t", "a0", "nk", "nseg", "bands", "forms", "pp_normalization", "units")
-    }, **scaled, normalize_forms=not args.raw_forms)
+    if argv is None:
+        # A Jupyter kernel puts its own -f kernel-....json in sys.argv,
+        # which argparse would reject; run the defaults there instead.
+        argv = [] if running_in_notebook() else sys.argv[1:]
+    args = parser.parse_args(argv)
+    p = build_parameters(
+        t=args.t, a0=args.a0, lam=args.lam, mu=args.mu,
+        temperature=args.temperature,
+        **{name: getattr(args, name) for name in
+           ("nk", "nseg", "bands", "forms", "pp_normalization", "units")},
+        normalize_forms=not args.raw_forms,
+    )
     p.validate()
-    args.out.mkdir(parents=True, exist_ok=True)
     print(json.dumps(asdict(p), indent=2))
     print(f"Susceptibilities are reported in {susceptibility_unit(p)}.")
-    solver = SusceptibilitySolver(p)
-    path, distance, ticks = gamma_x_m_gamma(p)
-    pair, ph = solver.solve(path)
-    save_data(args.out, p, path, distance, ticks, pair, ph,
-              solver.pp_channels, solver.ph_channels)
-    make_plots(p, distance, ticks, pair, ph,
-               solver.pp_channels, solver.ph_channels, args.out)
-    print(f"Saved two figures, full matrices, diagonal CSVs, and parameters to {args.out}")
+    results = run(out=args.out, parameters=p)
+    print(f"Saved two figures, full matrices, diagonal CSVs, and parameters "
+          f"to {results['out']}")
     import matplotlib.pyplot as plt
     if args.show:
         plt.show()
-    else:
+    elif not running_in_notebook():
         plt.close("all")
+    return results
 
 
 if __name__ == "__main__":
